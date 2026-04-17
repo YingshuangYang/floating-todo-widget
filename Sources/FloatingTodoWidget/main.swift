@@ -47,6 +47,12 @@ struct DailyTaskRecord: Codable {
     var tasks: [TaskItem]
 }
 
+struct MiniTaskPreview {
+    let numberLabel: String
+    let text: String
+    let isDone: Bool
+}
+
 @MainActor
 final class TodoStore: ObservableObject {
     private static let recordsKey = "FloatingTodoWidget.dailyRecords"
@@ -138,7 +144,7 @@ final class TodoStore: ObservableObject {
         return "No.\(visibleItems.count)"
     }
 
-    func miniPreviewTasks(limit: Int) -> [TaskItem] {
+    func miniPreviewTasks(limit: Int) -> [MiniTaskPreview] {
         let todayKey = Self.dayKey(for: Date())
         let sourceTasks: [TaskItem]
 
@@ -148,11 +154,22 @@ final class TodoStore: ObservableObject {
             sourceTasks = records[todayKey]?.tasks ?? []
         }
 
-        let active = Self.normalizedTasks(from: sourceTasks)
-            .filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        let normalized = Self.normalizedTasks(from: sourceTasks)
+        let numberedItems = normalized.enumerated().compactMap { index, item -> MiniTaskPreview? in
+            guard !item.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+            let visibleCount = normalized[0...index].filter {
+                !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }.count
 
-        let unfinished = active.filter { !$0.isDone }
-        let finished = active.filter(\.isDone)
+            return MiniTaskPreview(
+                numberLabel: "No.\(visibleCount)",
+                text: item.text,
+                isDone: item.isDone
+            )
+        }
+
+        let unfinished = numberedItems.filter { !$0.isDone }
+        let finished = numberedItems.filter(\.isDone)
         return Array((unfinished + finished).prefix(limit))
     }
 
@@ -236,7 +253,7 @@ final class TodoStore: ObservableObject {
         let nonEmptyCount = tasks.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.count
         let minimumTotal = max(Self.minimumRowCount, nonEmptyCount + 2)
         if tasks.count < minimumTotal {
-            tasks.append(contentsOf: Array(repeating: TaskItem(text: ""), count: minimumTotal - tasks.count))
+            tasks.append(contentsOf: (0..<(minimumTotal - tasks.count)).map { _ in TaskItem(text: "") })
         }
     }
 
@@ -279,12 +296,12 @@ final class TodoStore: ObservableObject {
         let trailingTrimmed = Array(trimmed.drop(while: { $0.text.isEmpty }).reversed().drop(while: { $0.text.isEmpty }).reversed())
         let base = trailingTrimmed.isEmpty ? [] : trailingTrimmed
         let minimumTotal = max(minimumRowCount, base.filter { !$0.text.isEmpty }.count + 2)
-        let blanks = Array(repeating: TaskItem(text: ""), count: max(0, minimumTotal - base.count))
+        let blanks = (0..<max(0, minimumTotal - base.count)).map { _ in TaskItem(text: "") }
         return base + blanks
     }
 
     private static func emptyTasks() -> [TaskItem] {
-        Array(repeating: TaskItem(text: ""), count: minimumRowCount)
+        (0..<minimumRowCount).map { _ in TaskItem(text: "") }
     }
 
     private static func dayKey(for date: Date) -> String {
@@ -618,8 +635,8 @@ struct ContentView: View {
                 if previewTasks.isEmpty {
                     miniEmptyState
                 } else {
-                    ForEach(Array(previewTasks.enumerated()), id: \.element.id) { offset, item in
-                        miniTaskRow(item: item, index: offset + 1)
+                    ForEach(Array(previewTasks.indices), id: \.self) { previewIndex in
+                        miniTaskRow(preview: previewTasks[previewIndex])
                     }
                 }
             }
@@ -662,34 +679,34 @@ struct ContentView: View {
             )
     }
 
-    private func miniTaskRow(item: TaskItem, index: Int) -> some View {
-        HStack(spacing: 10) {
+    private func miniTaskRow(preview: MiniTaskPreview) -> some View {
+        return HStack(spacing: 10) {
             ZStack {
                 Circle()
-                    .fill(item.isDone ? WidgetTheme.accent.opacity(0.18) : Color.white.opacity(0.82))
+                    .fill(preview.isDone ? WidgetTheme.accent.opacity(0.18) : Color.white.opacity(0.82))
                     .overlay(
                         Circle()
-                            .stroke(item.isDone ? WidgetTheme.accent.opacity(0.55) : WidgetTheme.line, lineWidth: 1)
+                            .stroke(preview.isDone ? WidgetTheme.accent.opacity(0.55) : WidgetTheme.line, lineWidth: 1)
                     )
                     .frame(width: 18, height: 18)
 
-                if item.isDone {
+                if preview.isDone {
                     Image(systemName: "checkmark")
                         .font(.system(size: 8, weight: .bold))
                         .foregroundStyle(WidgetTheme.accent)
                 }
             }
 
-            Text("No.\(index)")
+            Text(preview.numberLabel)
                 .font(.system(size: 11, weight: .semibold, design: .rounded))
                 .foregroundStyle(WidgetTheme.secondary)
                 .frame(width: 34, alignment: .leading)
 
-            Text(item.text)
+            Text(preview.text)
                 .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(item.isDone ? WidgetTheme.secondary : WidgetTheme.title)
+                .foregroundStyle(preview.isDone ? WidgetTheme.secondary : WidgetTheme.title)
                 .lineLimit(1)
-                .strikethrough(item.isDone)
+                .strikethrough(preview.isDone)
 
             Spacer(minLength: 0)
         }
@@ -697,7 +714,7 @@ struct ContentView: View {
         .padding(.vertical, 10)
         .background(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(Color.white.opacity(item.isDone ? 0.45 : 0.66))
+                .fill(Color.white.opacity(preview.isDone ? 0.45 : 0.66))
         )
     }
 
