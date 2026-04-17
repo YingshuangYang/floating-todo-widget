@@ -3,6 +3,7 @@
 An Apple-inspired floating desktop daily todo app for macOS, built with SwiftUI.
 
 ![Floating Todo Widget screenshot](docs/app-screenshot.png)
+![Floating Todo Widget mini screenshot](docs/mini-app-screenshot.png)
 
 ## Features
 
