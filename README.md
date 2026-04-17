@@ -45,7 +45,7 @@ swift run
 ## Build Release
 
 ```bash
-env CLANG_MODULE_CACHE_PATH=/Users/yys/Documents/skills/.build/module-cache swift build -c release
+env CLANG_MODULE_CACHE_PATH=.build/module-cache swift build -c release
 ```
 
 ## Package as a macOS App
@@ -57,7 +57,7 @@ zsh package_app.sh
 This creates:
 
 ```bash
-/Users/yys/Documents/skills/FloatingTodoWidget.app
+FloatingTodoWidget.app
 ```
 
 ## Install
@@ -65,7 +65,7 @@ This creates:
 Copy the generated app into `Applications`:
 
 ```bash
-cp -R /Users/yys/Documents/skills/FloatingTodoWidget.app /Applications/FloatingTodoWidget.app
+cp -R FloatingTodoWidget.app /Applications/FloatingTodoWidget.app
 ```
 
 ## Notes
