@@ -62,11 +62,15 @@ FloatingTodoWidget.app
 
 ## Install
 
-Copy the generated app into `Applications`:
+Build and package the app first, then copy it into `Applications`:
 
 ```bash
+env CLANG_MODULE_CACHE_PATH=.build/module-cache swift build -c release
+zsh package_app.sh
 cp -R FloatingTodoWidget.app /Applications/FloatingTodoWidget.app
 ```
+
+Or drag `FloatingTodoWidget.app` into `Applications` in Finder after packaging.
 
 ## Notes
 
