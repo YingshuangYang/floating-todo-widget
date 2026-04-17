@@ -16,53 +16,64 @@ enum WidgetTheme {
     static let ringTrack = Color.white.opacity(0.7)
 }
 
+enum TaskSource: String, Codable {
+    case manual
+}
+
 struct TaskItem: Identifiable, Codable {
     let id: UUID
     var text: String
-    var isDone: Bool = false
+    var isDone: Bool
+    var source: TaskSource
+    var sourceID: String?
 
-    init(id: UUID = UUID(), text: String, isDone: Bool = false) {
+    init(
+        id: UUID = UUID(),
+        text: String,
+        isDone: Bool = false,
+        source: TaskSource = .manual,
+        sourceID: String? = nil
+    ) {
         self.id = id
         self.text = text
         self.isDone = isDone
+        self.source = source
+        self.sourceID = sourceID
     }
 }
 
+struct DailyTaskRecord: Codable {
+    var dayKey: String
+    var tasks: [TaskItem]
+}
+
+@MainActor
 final class TodoStore: ObservableObject {
-    private static let storageKey = "FloatingTodoWidget.tasks"
+    private static let recordsKey = "FloatingTodoWidget.dailyRecords"
+    private static let minimumRowCount = 12
 
     @Published var tasks: [TaskItem] {
         didSet {
-            saveTasks()
+            saveCurrentRecord()
         }
     }
+
+    @Published var currentDayKey: String
+    private let calendar = Calendar.current
+    private var records: [String: DailyTaskRecord]
 
     init() {
-        if
-            let data = UserDefaults.standard.data(forKey: Self.storageKey),
-            let decoded = try? JSONDecoder().decode([TaskItem].self, from: data),
-            !decoded.isEmpty
-        {
-            self.tasks = decoded
+        self.records = Self.loadRecords()
+        let initialDayKey = Self.dayKey(for: Date())
+        self.currentDayKey = initialDayKey
+
+        if let record = records[initialDayKey] {
+            self.tasks = Self.normalizedTasks(from: record.tasks)
         } else {
-            self.tasks = Self.defaultTasks
+            self.tasks = Self.emptyTasks()
+            saveCurrentRecord()
         }
     }
-
-    private static let defaultTasks: [TaskItem] = [
-        TaskItem(text: "See a doctor"),
-        TaskItem(text: "PPT draft"),
-        TaskItem(text: "Snowflake video"),
-        TaskItem(text: "Apply 10 position"),
-        TaskItem(text: "PPT skills install"),
-        TaskItem(text: ""),
-        TaskItem(text: ""),
-        TaskItem(text: ""),
-        TaskItem(text: ""),
-        TaskItem(text: ""),
-        TaskItem(text: ""),
-        TaskItem(text: "")
-    ]
 
     var activeTaskCount: Int {
         tasks.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.count
@@ -84,6 +95,39 @@ final class TodoStore: ObservableObject {
         100 - completionPercent
     }
 
+    var formattedDate: String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .none
+        return formatter.string(from: Self.date(from: currentDayKey))
+    }
+
+    var relativeDayLabel: String {
+        let currentDate = Self.date(from: currentDayKey)
+
+        if calendar.isDateInToday(currentDate) {
+            return "Today"
+        }
+        if calendar.isDateInYesterday(currentDate) {
+            return "Yesterday"
+        }
+        if calendar.isDateInTomorrow(currentDate) {
+            return "Tomorrow"
+        }
+        return "Day View"
+    }
+
+    var isViewingToday: Bool {
+        calendar.isDateInToday(Self.date(from: currentDayKey))
+    }
+
+    var todayFormattedDate: String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .none
+        return formatter.string(from: Date())
+    }
+
     func numberLabel(at index: Int) -> String {
         guard tasks.indices.contains(index) else { return "" }
         let item = tasks[index]
@@ -94,21 +138,165 @@ final class TodoStore: ObservableObject {
         return "No.\(visibleItems.count)"
     }
 
+    func miniPreviewTasks(limit: Int) -> [TaskItem] {
+        let todayKey = Self.dayKey(for: Date())
+        let sourceTasks: [TaskItem]
+
+        if todayKey == currentDayKey {
+            sourceTasks = tasks
+        } else {
+            sourceTasks = records[todayKey]?.tasks ?? []
+        }
+
+        let active = Self.normalizedTasks(from: sourceTasks)
+            .filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+
+        let unfinished = active.filter { !$0.isDone }
+        let finished = active.filter(\.isDone)
+        return Array((unfinished + finished).prefix(limit))
+    }
+
+    func todayCompletionPercent() -> Int {
+        let todayKey = Self.dayKey(for: Date())
+        let sourceTasks: [TaskItem]
+
+        if todayKey == currentDayKey {
+            sourceTasks = tasks
+        } else {
+            sourceTasks = records[todayKey]?.tasks ?? []
+        }
+
+        let active = sourceTasks.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        guard !active.isEmpty else { return 0 }
+        let doneCount = active.filter(\.isDone).count
+        return Int((Double(doneCount) / Double(active.count) * 100).rounded())
+    }
+
     func syncTaskState(at index: Int) {
         let hasText = !tasks[index].text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         if !hasText {
             tasks[index].isDone = false
+            tasks[index].source = .manual
+            tasks[index].sourceID = nil
         }
+
+        ensureBlankCapacity()
+    }
+
+    func handleTaskTextChange(at index: Int) {
+        guard tasks.indices.contains(index) else { return }
+
+        let hasText = !tasks[index].text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if !hasText {
+            tasks[index].isDone = false
+            tasks[index].source = .manual
+            tasks[index].sourceID = nil
+        }
+
+        ensureBlankCapacity()
     }
 
     func focusableIndex(after index: Int) -> Int? {
         guard !tasks.isEmpty else { return nil }
-        return min(index + 1, tasks.count - 1)
+        let next = min(index + 1, tasks.count - 1)
+        return next
     }
 
-    private func saveTasks() {
-        guard let data = try? JSONEncoder().encode(tasks) else { return }
-        UserDefaults.standard.set(data, forKey: Self.storageKey)
+    func refreshForTodayIfNeeded() {
+        let todayKey = Self.dayKey(for: Date())
+        guard todayKey != currentDayKey else { return }
+        loadDay(todayKey)
+    }
+
+    func loadRelativeDay(_ offset: Int) {
+        guard let targetDate = calendar.date(byAdding: .day, value: offset, to: Self.date(from: currentDayKey)) else {
+            return
+        }
+        loadDay(Self.dayKey(for: targetDate))
+    }
+
+    func loadToday() {
+        let todayKey = Self.dayKey(for: Date())
+        loadDay(todayKey)
+    }
+
+    private func loadDay(_ dayKey: String) {
+        saveCurrentRecord()
+        currentDayKey = dayKey
+
+        if let record = records[dayKey] {
+            tasks = Self.normalizedTasks(from: record.tasks)
+        } else {
+            tasks = Self.emptyTasks()
+            saveCurrentRecord()
+        }
+    }
+
+    private func ensureBlankCapacity() {
+        let nonEmptyCount = tasks.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.count
+        let minimumTotal = max(Self.minimumRowCount, nonEmptyCount + 2)
+        if tasks.count < minimumTotal {
+            tasks.append(contentsOf: Array(repeating: TaskItem(text: ""), count: minimumTotal - tasks.count))
+        }
+    }
+
+    private func saveCurrentRecord() {
+        let normalized = Self.normalizedTasks(from: tasks)
+        var record = records[currentDayKey] ?? DailyTaskRecord(dayKey: currentDayKey, tasks: normalized)
+        record.tasks = normalized
+        records[currentDayKey] = record
+        saveRecords()
+    }
+
+    private func saveRecords() {
+        guard let data = try? JSONEncoder().encode(records) else { return }
+        UserDefaults.standard.set(data, forKey: Self.recordsKey)
+    }
+
+    private static func loadRecords() -> [String: DailyTaskRecord] {
+        guard
+            let data = UserDefaults.standard.data(forKey: recordsKey),
+            let decoded = try? JSONDecoder().decode([String: DailyTaskRecord].self, from: data)
+        else {
+            return [:]
+        }
+
+        return decoded
+    }
+
+    private static func normalizedTasks(from tasks: [TaskItem]) -> [TaskItem] {
+        let trimmed = tasks.map { item in
+            var copy = item
+            if copy.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                copy.text = ""
+                copy.isDone = false
+                copy.source = .manual
+                copy.sourceID = nil
+            }
+            return copy
+        }
+
+        let trailingTrimmed = Array(trimmed.drop(while: { $0.text.isEmpty }).reversed().drop(while: { $0.text.isEmpty }).reversed())
+        let base = trailingTrimmed.isEmpty ? [] : trailingTrimmed
+        let minimumTotal = max(minimumRowCount, base.filter { !$0.text.isEmpty }.count + 2)
+        let blanks = Array(repeating: TaskItem(text: ""), count: max(0, minimumTotal - base.count))
+        return base + blanks
+    }
+
+    private static func emptyTasks() -> [TaskItem] {
+        Array(repeating: TaskItem(text: ""), count: minimumRowCount)
+    }
+
+    private static func dayKey(for date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: date)
+    }
+
+    private static func date(from dayKey: String) -> Date {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.date(from: dayKey) ?? Date()
     }
 }
 
@@ -192,24 +380,26 @@ struct TodoRowView: View {
             }
 
             cell(width: nil) {
-                ZStack(alignment: .leading) {
-                    TextField("Add task", text: $item.text)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundStyle(item.isDone ? WidgetTheme.secondary : WidgetTheme.title)
-                        .focused(focusedField, equals: index)
-                        .submitLabel(.next)
-                        .onChange(of: item.text) { _ in
-                            onTextChange()
-                        }
-                        .onSubmit(onSubmit)
+                HStack(spacing: 8) {
+                    ZStack(alignment: .leading) {
+                        TextField("Add task", text: $item.text)
+                            .textFieldStyle(.plain)
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(item.isDone ? WidgetTheme.secondary : WidgetTheme.title)
+                            .focused(focusedField, equals: index)
+                            .submitLabel(.next)
+                            .onChange(of: item.text) { _ in
+                                onTextChange()
+                            }
+                            .onSubmit(onSubmit)
 
-                    if shouldStrike {
-                        Rectangle()
-                            .fill(WidgetTheme.secondary.opacity(0.7))
-                            .frame(height: 1.2)
-                            .padding(.trailing, 8)
-                            .allowsHitTesting(false)
+                        if shouldStrike {
+                            Rectangle()
+                                .fill(WidgetTheme.secondary.opacity(0.7))
+                                .frame(height: 1.2)
+                                .padding(.trailing, 8)
+                                .allowsHitTesting(false)
+                        }
                     }
                 }
             }
@@ -237,29 +427,48 @@ struct ContentView: View {
     @FocusState private var focusedField: Int?
 
     var body: some View {
-        ZStack {
-            LinearGradient(
-                colors: [WidgetTheme.backgroundTop, WidgetTheme.backgroundBottom],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            .ignoresSafeArea()
+        GeometryReader { proxy in
+            let isMiniMode = proxy.size.width < 640 || proxy.size.height < 430
 
-            VStack(spacing: 18) {
-                header
+            ZStack {
+                LinearGradient(
+                    colors: [WidgetTheme.backgroundTop, WidgetTheme.backgroundBottom],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                .ignoresSafeArea()
 
-                HStack(alignment: .top, spacing: 18) {
-                    taskPanel
-                    statusPanel
+                if isMiniMode {
+                    miniModeView(height: proxy.size.height)
+                } else {
+                    VStack(spacing: 18) {
+                        header
+
+                        HStack(alignment: .top, spacing: 18) {
+                            taskPanel
+                            statusPanel
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                    }
+                    .padding(.bottom, 20)
                 }
             }
+            .overlay(
+                RoundedRectangle(cornerRadius: 28, style: .continuous)
+                    .stroke(Color.white.opacity(0.45), lineWidth: 1)
+                    .padding(12)
+            )
+            .onAppear {
+                store.refreshForTodayIfNeeded()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .NSCalendarDayChanged)) { _ in
+                store.refreshForTodayIfNeeded()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+                store.refreshForTodayIfNeeded()
+            }
         }
-        .frame(width: 700, height: 540)
-        .overlay(
-            RoundedRectangle(cornerRadius: 28, style: .continuous)
-                .stroke(Color.white.opacity(0.45), lineWidth: 1)
-                .padding(12)
-        )
+        .frame(minWidth: 340, idealWidth: 860, maxWidth: .infinity, minHeight: 280, idealHeight: 620, maxHeight: .infinity)
     }
 
     private var header: some View {
@@ -269,25 +478,58 @@ struct ContentView: View {
                     .font(.system(size: 28, weight: .semibold, design: .rounded))
                     .foregroundStyle(WidgetTheme.title)
 
-                Text("A calm space for today's priorities")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(WidgetTheme.secondary)
+                HStack(spacing: 10) {
+                    dayNavButton(systemName: "chevron.left") {
+                        store.loadRelativeDay(-1)
+                    }
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(store.relativeDayLabel)
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(WidgetTheme.secondary)
+
+                        Text(store.formattedDate)
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(WidgetTheme.secondary.opacity(0.85))
+                    }
+
+                    dayNavButton(systemName: "chevron.right") {
+                        store.loadRelativeDay(1)
+                    }
+
+                    Button("Today") {
+                        store.loadToday()
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(WidgetTheme.accent)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(
+                        Capsule(style: .continuous)
+                            .fill(WidgetTheme.accentSoft.opacity(0.9))
+                    )
+                }
             }
 
             Spacer()
-
-            Text("Today")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(WidgetTheme.accent)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(
-                    Capsule(style: .continuous)
-                        .fill(WidgetTheme.accentSoft)
-                )
         }
         .padding(.horizontal, 24)
         .padding(.top, 22)
+    }
+
+    private func dayNavButton(systemName: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(WidgetTheme.accent)
+                .frame(width: 26, height: 26)
+                .background(
+                    Circle()
+                        .fill(Color.white.opacity(0.72))
+                )
+        }
+        .buttonStyle(.plain)
     }
 
     private var taskPanel: some View {
@@ -312,7 +554,7 @@ struct ContentView: View {
                     number: store.numberLabel(at: index),
                     focusedField: $focusedField,
                     onTextChange: {
-                        store.syncTaskState(at: index)
+                        store.handleTaskTextChange(at: index)
                     },
                     onSubmit: {
                         focusedField = store.focusableIndex(after: index)
@@ -326,7 +568,7 @@ struct ContentView: View {
                 }
             }
         }
-        .frame(width: 430)
+        .frame(minWidth: 420, idealWidth: 520, maxWidth: .infinity)
         .frame(maxHeight: .infinity, alignment: .top)
         .background(
             RoundedRectangle(cornerRadius: 26, style: .continuous)
@@ -338,6 +580,125 @@ struct ContentView: View {
                 .stroke(WidgetTheme.line, lineWidth: 1)
         )
         .shadow(color: Color.black.opacity(0.08), radius: 18, y: 8)
+    }
+
+    private func miniModeView(height: CGFloat) -> some View {
+        let visibleCount = height < 340 ? 3 : 4
+        let previewTasks = store.miniPreviewTasks(limit: visibleCount)
+        let progress = store.todayCompletionPercent()
+
+        return VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Today")
+                        .font(.system(size: 24, weight: .semibold, design: .rounded))
+                        .foregroundStyle(WidgetTheme.title)
+
+                    Text(store.todayFormattedDate)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(WidgetTheme.secondary)
+                }
+
+                Spacer()
+
+                VStack(alignment: .trailing, spacing: 4) {
+                    Text("\(progress)%")
+                        .font(.system(size: 22, weight: .semibold, design: .rounded))
+                        .foregroundStyle(WidgetTheme.title)
+
+                    Text("done")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(WidgetTheme.secondary)
+                        .textCase(.uppercase)
+                        .tracking(1)
+                }
+            }
+
+            VStack(spacing: 8) {
+                if previewTasks.isEmpty {
+                    miniEmptyState
+                } else {
+                    ForEach(Array(previewTasks.enumerated()), id: \.element.id) { offset, item in
+                        miniTaskRow(item: item, index: offset + 1)
+                    }
+                }
+            }
+
+            Spacer(minLength: 0)
+
+            HStack {
+                Label("Daily list", systemImage: "checklist")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(WidgetTheme.secondary)
+
+                Spacer()
+
+                if !store.isViewingToday {
+                    Button("Back to Today") {
+                        store.loadToday()
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(WidgetTheme.accent)
+                }
+            }
+        }
+        .padding(20)
+    }
+
+    private var miniEmptyState: some View {
+        RoundedRectangle(cornerRadius: 18, style: .continuous)
+            .fill(Color.white.opacity(0.62))
+            .frame(maxWidth: .infinity, minHeight: 96)
+            .overlay(
+                VStack(spacing: 6) {
+                    Image(systemName: "checklist")
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundStyle(WidgetTheme.accent)
+                    Text("No tasks for today")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(WidgetTheme.secondary)
+                }
+            )
+    }
+
+    private func miniTaskRow(item: TaskItem, index: Int) -> some View {
+        HStack(spacing: 10) {
+            ZStack {
+                Circle()
+                    .fill(item.isDone ? WidgetTheme.accent.opacity(0.18) : Color.white.opacity(0.82))
+                    .overlay(
+                        Circle()
+                            .stroke(item.isDone ? WidgetTheme.accent.opacity(0.55) : WidgetTheme.line, lineWidth: 1)
+                    )
+                    .frame(width: 18, height: 18)
+
+                if item.isDone {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(WidgetTheme.accent)
+                }
+            }
+
+            Text("No.\(index)")
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .foregroundStyle(WidgetTheme.secondary)
+                .frame(width: 34, alignment: .leading)
+
+            Text(item.text)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(item.isDone ? WidgetTheme.secondary : WidgetTheme.title)
+                .lineLimit(1)
+                .strikethrough(item.isDone)
+
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Color.white.opacity(item.isDone ? 0.45 : 0.66))
+        )
     }
 
     private func headerCell(_ title: String, width: CGFloat?) -> some View {
@@ -379,7 +740,7 @@ struct ContentView: View {
             Spacer()
         }
         .padding(22)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .frame(minWidth: 250, idealWidth: 300, maxWidth: 360, maxHeight: .infinity, alignment: .top)
         .background(
             RoundedRectangle(cornerRadius: 26, style: .continuous)
                 .fill(WidgetTheme.card)
@@ -419,6 +780,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
             guard let window = NSApplication.shared.windows.first else { return }
+            window.styleMask.insert(.resizable)
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
             window.isMovableByWindowBackground = true
@@ -427,6 +789,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window.isOpaque = false
             window.backgroundColor = .clear
             window.hasShadow = true
+            window.minSize = NSSize(width: 340, height: 280)
+            window.setContentSize(NSSize(width: 860, height: 620))
             window.center()
         }
     }
@@ -440,6 +804,6 @@ struct FloatingTodoWidgetApp: App {
         WindowGroup {
             ContentView()
         }
-        .windowResizability(.contentSize)
+        .defaultSize(width: 860, height: 620)
     }
 }
